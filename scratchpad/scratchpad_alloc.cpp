@@ -1,8 +1,4 @@
-#include <stdint.h>
-
-#define SCPAD_SIZE_BYTES (1 * 1024 * 1024) // 1MB per scratchpad
-#define BF16_SIZE 2                         
-#define ALIGNMENT 64                   //not needed
+#include "scratchpad_alloc.h"
 
 static uint8_t* scpad0_base = (uint8_t*)0x0; // base Address
 static uint8_t* scpad1_base = (uint8_t*)0x0; 
