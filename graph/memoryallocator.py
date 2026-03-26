@@ -6,8 +6,9 @@ import torch
 from torch.fx import GraphModule, Node
 
 
-TILE_BYTES = 32 * 32 * 2  # 2 KB tiles (32x32 bf16 values)
-BF16_NUM_BYTES = 2
+TILE_HEIGHT = 32
+TILE_WIDTH = 32
+TILE_BYTES = TILE_HEIGHT * TILE_WIDTH * 2  # 2 KB tiles, bf16 2 bytes each
 LINE_BYTES = 16 #number of bytes to display per line in dram.txt
 
 
@@ -22,14 +23,23 @@ def tensor_nbytes(node: Node) -> int:
         raise ValueError(
             f"dtype {tensor_meta.dtype} for node {node.name} is not torch.bfloat16")
 
-    if len(tensor_meta.shape) != 2:
-        raise ValueError(f"Shape {tensor_meta.shape} for node {node.name} is not 2D")
+    outer = 1
+    shape = tensor_meta.shape
+    if len(shape) == 1:
+        height = 1
+        width = int(shape[0])
+    else:
+        for dim in shape[:-2]:
+            outer *= int(dim)
+        height = int(shape[-2])
+        width = int(shape[-1])
 
-    numel = 1
-    for dim in tensor_meta.shape:
-        numel *= int(dim)
+    tiles_h = math.ceil(height / TILE_HEIGHT)
+    tiles_w = math.ceil(width / TILE_WIDTH)
+    tiles_per_plane = tiles_h * tiles_w
+    total_tiles = max(1, outer) * tiles_per_plane
 
-    return numel * BF16_NUM_BYTES
+    return total_tiles * TILE_BYTES
 
 
 def tensor_for_node(
@@ -47,12 +57,42 @@ def tensor_for_node(
 
     return None
 
-#TODO: write data in 32x32 tiles, not just row-wise
 def tensor_bytes(tensor: torch.Tensor, allocation_size: int) -> bytes:
     tensor = tensor.detach().cpu().contiguous()
-    data = tensor.view(torch.uint16).numpy().astype(np.uint16)
-    raw = data.tobytes(order="C")
-    return raw + bytes(allocation_size - len(raw)) #pad to allocation size if needed (tensor < 32x32)
+    if tensor.ndim == 0:
+        raise ValueError("Scalar tensor")
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+
+    if tensor.ndim > 2:
+        outer = 1
+        for dim in tensor.shape[:-2]:
+            outer *= int(dim)
+        height = tensor.shape[-2]
+        width = tensor.shape[-1]
+        tensor = tensor.view(outer, height, width)
+    else:
+        tensor = tensor.unsqueeze(0)
+        height = tensor.shape[-2]
+        width = tensor.shape[-1]
+
+    tiles = []
+    for matrix in tensor:
+        for row in range(0, height, TILE_HEIGHT):
+            for col in range(0, width, TILE_WIDTH):
+                tile = torch.zeros((TILE_HEIGHT, TILE_WIDTH), dtype=tensor.dtype)
+                h_chunk = min(TILE_HEIGHT, height - row)
+                w_chunk = min(TILE_WIDTH, width - col)
+                tile[:h_chunk, :w_chunk] = matrix[row:row + h_chunk, col:col + w_chunk]
+                tiles.append(tile)
+
+    raw = b"".join(
+        tile.view(torch.uint16).numpy().astype(np.uint16).tobytes(order="C")
+        for tile in tiles
+    )
+    if len(raw) > allocation_size:
+        raise ValueError("Tile payload larger than allocation size")
+    return raw + bytes(allocation_size - len(raw))
 
 
 def write_dram(file, start_addr: int, payload: bytes) -> None:
